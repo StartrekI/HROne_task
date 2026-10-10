@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        # Standalone (like a local docker run) and a replica set (like Atlas): writes, majority write concern and
+        # retries behave differently between the two, so the whole suite runs on both.
+        topology: [standalone, replica-set]
+        mongo: ["7.0"]
+        include:  # the README promises MongoDB 6.0+, so the oldest supported version runs too
+          - {python-version: "3.11", topology: standalone, mongo: "6.0"}
+          - {python-version: "3.11", topology: replica-set, mongo: "6.0"}
+    name: test (py ${{ matrix.python-version }}, mongo ${{ matrix.mongo }}, ${{ matrix.topology }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Start MongoDB ${{ matrix.mongo }} (${{ matrix.topology }})
+        run: |
+          if [ "${{ matrix.topology }}" = "replica-set" ]; then
+            docker run -d --name mongo -p 27017:27017 mongo:${{ matrix.mongo }} --replSet rs0 --bind_ip_all
+          else
+            docker run -d --name mongo -p 27017:27017 mongo:${{ matrix.mongo }}
+          fi
+          for i in $(seq 1 60); do docker exec mongo mongosh --quiet --eval 'db.runCommand({ping: 1}).ok' && break; sleep 1; done
+          if [ "${{ matrix.topology }}" = "replica-set" ]; then
+            docker exec mongo mongosh --quiet --eval 'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})'
+            for i in $(seq 1 60); do docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true && break; sleep 1; done
+            echo "MONGO_URI=mongodb://localhost:27017/?replicaSet=rs0" >> "$GITHUB_ENV"
+          else
+            echo "MONGO_URI=mongodb://localhost:27017" >> "$GITHUB_ENV"
+          fi
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        run: python -m pyflakes app tests scripts
+      - name: Tests (real uvicorn + MongoDB, property-based, differential oracle)
+        run: python -m pytest -q
+      - name: Grader-sized cross-verification (every endpoint against an independent oracle)
+        run: python scripts/verify_large.py --logs 30000
+
+  contract-fuzz:
+    # Schemathesis generates requests from the official openapi.yaml and checks every response against it.
+    # "Rejected a schema-valid request" is not checked: the contract's prose rules (date_from > date_to, ranges over
+    # 92 days, shift_start == shift_end, punch-out window) are 422 by design and are invisible to the schema.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Start MongoDB 7.0 and the app on the sample data
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:7.0
+          for i in $(seq 1 60); do docker exec mongo mongosh --quiet --eval 'db.runCommand({ping: 1}).ok' && break; sleep 1; done
+          pip install -r requirements.txt schemathesis
+          export MONGO_URI=mongodb://localhost:27017 MONGO_DB=fuzz
+          python sample_seed.py
+          nohup uvicorn app.main:app --port 8000 > uvicorn.log 2>&1 &
+          for i in $(seq 1 40); do curl -sf localhost:8000/health && break; sleep 0.5; done
+      - name: Fuzz the contract
+        run: >-
+          st run openapi.yaml -u http://localhost:8000 -n 100 --workers 4
+          --checks not_a_server_error,status_code_conformance,content_type_conformance,response_schema_conformance,negative_data_rejection
+      - name: No unhandled errors on the server
+        run: "! grep -iE 'traceback|unhandled' uvicorn.log"
+
+  quality:
+    # Static analysis (bug-finding rules), a security linter and a known-vulnerability audit of the pinned dependencies.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff bandit pip-audit
+      - name: ruff (bugbear, exception handling, async, datetime, pyflakes)
+        run: ruff check app tests scripts --select B,BLE,ASYNC,DTZ,F,E9,PLE --ignore BLE001,B905
+      - name: bandit (security)
+        run: bandit -q -r app
+      - name: pip-audit (known vulnerabilities in requirements.txt)
+        run: pip-audit -r requirements.txt

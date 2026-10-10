@@ -1,0 +1,10 @@
+# Exact versions, verified by the test matrix (Python 3.11 - 3.13, MongoDB 6.0 / 7.0). Pinned so that an install on
+# a later date gets exactly what was tested, not a newer major release with breaking changes.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+pymongo==4.18.3
+pydantic==2.14.0
+python-dotenv==1.2.4
+# Imported directly by app/main.py (also FastAPI dependencies; pinned to the versions it resolves to).
+starlette==1.7.0
+anyio==4.15.1

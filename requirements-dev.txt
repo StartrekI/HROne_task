@@ -1,0 +1,6 @@
+pytest>=8
+httpx>=0.27
+pyflakes>=3
+hypothesis>=6.100
+pyyaml>=6
+jsonschema>=4
